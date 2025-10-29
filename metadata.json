@@ -1,0 +1,5 @@
+{
+  "name": "Bolinha Rolante",
+  "description": "Um jogo de plataforma simples onde o jogador controla uma bolinha que rola e pula para chegar ao final de uma fase única.",
+  "requestFramePermissions": []
+}
