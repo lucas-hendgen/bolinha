@@ -2,40 +2,48 @@ import React, { useState, useEffect } from 'react';
 import { Game } from './components/Game';
 import { StartScreen } from './screens/StartScreen';
 import { LevelSelectScreen } from './screens/LevelSelectScreen';
-import { LEVELS } from './constants';
-import type { GameScreen } from './types';
+import { LEVELS } from './levels';
+import type { GameScreen, Progress } from './types';
 
 const PROGRESS_KEY = 'bolinhaRolanteProgress';
 
 const App: React.FC = () => {
   const [screen, setScreen] = useState<GameScreen>('start_screen');
   const [currentLevelId, setCurrentLevelId] = useState<number>(1);
-  const [unlockedLevels, setUnlockedLevels] = useState<number[]>(() => {
+  const [progress, setProgress] = useState<Progress>(() => {
     try {
       const savedProgress = window.localStorage.getItem(PROGRESS_KEY);
       if (savedProgress) {
-        const levels = JSON.parse(savedProgress);
-        if (Array.isArray(levels) && levels.every(l => typeof l === 'number')) {
-          return levels;
+        const parsed = JSON.parse(savedProgress);
+        // Migration from old format (array of numbers) to new format (object)
+        if (Array.isArray(parsed)) {
+          const newProgress: Progress = {};
+          parsed.forEach(levelId => {
+            newProgress[levelId] = null; // Mark as unlocked, no time yet
+          });
+          return newProgress;
+        }
+        if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+          return parsed;
         }
       }
     } catch (error) {
       console.error("Failed to load progress:", error);
     }
-    return [1]; // Start with level 1 unlocked
+    return { 1: null }; // Start with level 1 unlocked
   });
 
   useEffect(() => {
     try {
-      window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(unlockedLevels));
+      window.localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
     } catch (error) {
       console.error("Failed to save progress:", error);
     }
-  }, [unlockedLevels]);
+  }, [progress]);
 
   const handleNewGame = () => {
-    if (window.confirm("Tem certeza que deseja apagar seu progresso e começar um novo jogo?")) {
-      setUnlockedLevels([1]);
+    if (window.confirm("Tem certeza que deseja apagar todo o seu progresso e começar um novo jogo?")) {
+      setProgress({ 1: null });
       setCurrentLevelId(1);
       setScreen('playing');
     }
@@ -58,12 +66,34 @@ const App: React.FC = () => {
     setScreen('level_select');
   };
 
-  const handleLevelWin = () => {
+  const handleLevelComplete = (time: number) => {
+    setProgress(prev => {
+        const newProgress = { ...prev };
+        
+        // Update current level's best time
+        const existingTime = newProgress[currentLevelId];
+        if (existingTime === null || time < existingTime) {
+            newProgress[currentLevelId] = time;
+        }
+
+        // Unlock next level
+        const nextLevelId = currentLevelId + 1;
+        if (nextLevelId <= LEVELS.length && !(nextLevelId in newProgress)) {
+            newProgress[nextLevelId] = null;
+        }
+
+        return newProgress;
+    });
+  };
+  
+  const handleContinue = () => {
     const nextLevelId = currentLevelId + 1;
-    if (nextLevelId <= LEVELS.length && !unlockedLevels.includes(nextLevelId)) {
-      setUnlockedLevels(prev => [...prev, nextLevelId].sort((a,b) => a-b));
+    if (nextLevelId <= LEVELS.length) {
+      setCurrentLevelId(nextLevelId);
+    } else {
+      alert("Parabéns! Você completou todos os níveis!");
+      setScreen('level_select');
     }
-    setScreen('level_select');
   };
 
   const renderScreen = () => {
@@ -79,7 +109,7 @@ const App: React.FC = () => {
         return (
           <LevelSelectScreen 
             levels={LEVELS}
-            unlockedLevels={unlockedLevels}
+            progress={progress}
             onSelectLevel={handleLevelSelect}
             onBack={handleBackToMenu}
           />
@@ -91,8 +121,10 @@ const App: React.FC = () => {
             <Game 
               key={currentLevel.id}
               level={currentLevel} 
-              onWin={handleLevelWin}
+              onWin={handleLevelComplete}
+              onContinue={handleContinue}
               onQuit={handleQuitGame}
+              bestTime={progress[currentLevelId] ?? null}
             />
           );
         }

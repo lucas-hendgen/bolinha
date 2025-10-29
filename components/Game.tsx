@@ -2,23 +2,58 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Player } from './Player';
 import { Platform } from './Platform';
 import { Goal } from './Goal';
+import { Hazard } from './Hazard';
+import { Liquid } from './Liquid';
 import { useKeyboard } from '../hooks/useKeyboard';
-import { GAME_WIDTH, GAME_HEIGHT, PLAYER_SIZE } from '../constants';
-import type { Vector2D, Level, GameStatus } from '../types';
+import { 
+  GAME_WIDTH, 
+  GAME_HEIGHT, 
+  PLAYER_SIZE,
+  GRAVITY,
+  JUMP_FORCE,
+  MOVE_SPEED,
+  FRICTION,
+  WATER_GRAVITY,
+  WATER_JUMP_FORCE,
+  WATER_FRICTION,
+  WATER_MOVE_SPEED
+} from '../constants';
+import type { Vector2D, Level, GameStatus, Platform as PlatformType, Liquid as LiquidType } from '../types';
 
 interface GameProps {
   level: Level;
-  onWin: () => void;
+  onWin: (time: number) => void;
+  onContinue: () => void;
   onQuit: () => void;
+  bestTime: number | null;
 }
 
-export const Game: React.FC<GameProps> = ({ level, onWin, onQuit }) => {
+const formatTime = (ms: number) => {
+    const minutes = Math.floor(ms / 60000);
+    const seconds = Math.floor((ms % 60000) / 1000);
+    const milliseconds = Math.floor(ms % 1000);
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(3, '0')}`;
+};
+
+export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, bestTime }) => {
   const [gameStatus, setGameStatus] = useState<GameStatus>('playing');
   const [playerPosition, setPlayerPosition] = useState<Vector2D>(level.startPosition);
+  const [elapsedTime, setElapsedTime] = useState(0);
+  const [finalTime, setFinalTime] = useState(0);
+  
   const playerVelocity = useRef<Vector2D>({ x: 0, y: 0 });
   const playerRotation = useRef<number>(0);
   const isGrounded = useRef<boolean>(false);
   const gameLoopRef = useRef<number>();
+  const startTimeRef = useRef<number>(0);
+  const continueButtonRef = useRef<HTMLButtonElement>(null);
+
+  // Note: Using refs for moving objects to avoid re-renders inside the game loop.
+  const movingPlatformsRef = useRef<PlatformType[]>([]);
+  const movingLiquidsRef = useRef<LiquidType[]>([]);
+  
+  const platformPlayerIsOnRef = useRef<PlatformType | null>(null);
+  const prevPlatformPositionsRef = useRef<{ [key: number]: Vector2D }>({});
   
   const keyboardState = useKeyboard();
 
@@ -27,97 +62,225 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onQuit }) => {
     playerVelocity.current = { x: 0, y: 0 };
     playerRotation.current = 0;
     isGrounded.current = false;
+    platformPlayerIsOnRef.current = null;
+    prevPlatformPositionsRef.current = {};
+    movingPlatformsRef.current = level.platforms;
+    movingLiquidsRef.current = level.liquids || [];
+    setElapsedTime(0);
+    startTimeRef.current = performance.now();
     setGameStatus('playing');
-  }, [level.startPosition]);
+  }, [level]);
 
   useEffect(() => {
     resetGame();
   }, [level.id, resetGame]);
 
-  const gameLoop = useCallback(() => {
-    if (gameStatus !== 'playing') return;
+  const gameLoop = useCallback((timestamp: number) => {
+    if (gameStatus !== 'playing') {
+      cancelAnimationFrame(gameLoopRef.current!);
+      return;
+    }
+    
+    setElapsedTime(performance.now() - startTimeRef.current);
 
-    // Horizontal movement
+    const time = performance.now();
+
+    // 1. Update moving platforms and liquids
+    const currentPlatforms = level.platforms.map(p => {
+      if (p.movement) {
+        const newPlatform = { ...p, position: { ...p.position } };
+        const totalDistance = p.movement.range[1] - p.movement.range[0];
+        const cycleDuration = (totalDistance / p.movement.speed) * 2;
+        const phase = (time / 1000) % cycleDuration;
+        
+        let positionOffset;
+        if (phase <= cycleDuration / 2) {
+          positionOffset = phase * p.movement.speed;
+        } else {
+          positionOffset = (cycleDuration - phase) * p.movement.speed;
+        }
+
+        if (p.movement.type === 'horizontal') {
+          newPlatform.position.x = p.movement.range[0] + positionOffset;
+        } else {
+          newPlatform.position.y = p.movement.range[0] + positionOffset;
+        }
+        return newPlatform;
+      }
+      return p;
+    });
+    movingPlatformsRef.current = currentPlatforms;
+
+    const currentLiquids = (level.liquids || []).map(l => {
+      if (l.movement) {
+        const newLiquid = { ...l, position: { ...l.position } };
+        const totalDistance = l.movement.range[1] - l.movement.range[0];
+        const cycleDuration = (totalDistance / l.movement.speed) * 2;
+        const phase = (time / 1000) % cycleDuration;
+        
+        let positionOffset;
+        if (phase <= cycleDuration / 2) {
+          positionOffset = phase * l.movement.speed;
+        } else {
+          // FIX: Corrected a typo using 'p' instead of 'l' for liquid movement calculation.
+          positionOffset = (cycleDuration - phase) * l.movement.speed;
+        }
+
+        if (l.movement.type === 'horizontal') {
+          newLiquid.position.x = l.movement.range[0] + positionOffset;
+        } else {
+          newLiquid.position.y = l.movement.range[0] + positionOffset;
+        }
+        return newLiquid;
+      }
+      return l;
+    });
+    movingLiquidsRef.current = currentLiquids;
+    
+    // 2. Initialize new position, velocity and state for this frame
+    let newPos = { ...playerPosition };
+    let newVel = { ...playerVelocity.current };
+    let isNowGrounded = false;
+    let onPlatform: PlatformType | null = null;
+    
+    // 3. Check for water physics
+    let inWater = false;
+    for (const liquid of currentLiquids) {
+      if (
+        newPos.x + PLAYER_SIZE > liquid.position.x &&
+        newPos.x < liquid.position.x + liquid.size.width &&
+        newPos.y + PLAYER_SIZE > liquid.position.y &&
+        newPos.y < liquid.position.y + liquid.size.height
+      ) {
+        inWater = true;
+        break;
+      }
+    }
+
+    const currentGravity = inWater ? WATER_GRAVITY : GRAVITY;
+    const currentJumpForce = inWater ? WATER_JUMP_FORCE : JUMP_FORCE;
+    const currentMoveSpeed = inWater ? WATER_MOVE_SPEED : MOVE_SPEED;
+    const currentFriction = inWater ? WATER_FRICTION : FRICTION;
+    
+    // 4. Physics & Input
     const { ArrowLeft, ArrowRight, ' ': Space } = keyboardState.current;
     if (ArrowLeft) {
-      playerVelocity.current.x = -5;
+      newVel.x = -currentMoveSpeed;
     } else if (ArrowRight) {
-      playerVelocity.current.x = 5;
+      newVel.x = currentMoveSpeed;
     } else {
-      playerVelocity.current.x *= 0.9; // Friction
+      newVel.x *= currentFriction;
     }
 
-    // Jumping
+    // Use grounded state from *previous* frame for jump check
     if (Space && isGrounded.current) {
-      playerVelocity.current.y = -13;
-      isGrounded.current = false;
+      newVel.y = currentJumpForce;
+      isGrounded.current = false; // Prevent multi-jumps
+      platformPlayerIsOnRef.current = null;
     }
 
-    // Apply gravity
-    playerVelocity.current.y += 0.6;
+    newVel.y += currentGravity;
 
-    // Update position
-    let newPos = {
-      x: playerPosition.x + playerVelocity.current.x,
-      y: playerPosition.y + playerVelocity.current.y,
-    };
+    // 5. Collision Detection & Resolution
+    // X-axis
+    newPos.x += newVel.x;
+    for (const platform of currentPlatforms) {
+      if (
+        newPos.y + PLAYER_SIZE > platform.position.y &&
+        newPos.y < platform.position.y + platform.size.height &&
+        newPos.x + PLAYER_SIZE > platform.position.x &&
+        newPos.x < platform.position.x + platform.size.width
+      ) {
+        if (newVel.x > 0) { // Moving right
+          newPos.x = platform.position.x - PLAYER_SIZE;
+        } else if (newVel.x < 0) { // Moving left
+          newPos.x = platform.position.x + platform.size.width;
+        }
+        newVel.x = 0;
+      }
+    }
 
-    isGrounded.current = false;
+    // Y-axis
+    newPos.y += newVel.y;
+    for (const platform of currentPlatforms) {
+      if (
+        newPos.x + PLAYER_SIZE > platform.position.x &&
+        newPos.x < platform.position.x + platform.size.width &&
+        newPos.y + PLAYER_SIZE > platform.position.y &&
+        newPos.y < platform.position.y + platform.size.height
+      ) {
+        // Landing on a platform
+        if (newVel.y > 0 && playerPosition.y + PLAYER_SIZE <= platform.position.y + 1) {
+          newPos.y = platform.position.y - PLAYER_SIZE;
+          newVel.y = 0;
+          isNowGrounded = true;
 
-    // Collision detection with platforms
-    for (const platform of level.platforms) {
-      const playerBottom = newPos.y + PLAYER_SIZE;
-      const playerTop = newPos.y;
-      const playerLeft = newPos.x;
-      const playerRight = newPos.x + PLAYER_SIZE;
+          const originalPlatformIndex = currentPlatforms.indexOf(platform);
+          onPlatform = level.platforms[originalPlatformIndex];
 
-      const platformTop = platform.position.y;
-      const platformBottom = platform.position.y + platform.size.height;
-      const platformLeft = platform.position.x;
-      const platformRight = platform.position.x + platform.size.width;
+          // Carry player with the platform horizontally
+          const prevPlatformPos = prevPlatformPositionsRef.current[originalPlatformIndex];
+          if (prevPlatformPos) {
+              const dx = platform.position.x - prevPlatformPos.x;
+              newPos.x += dx;
+          }
 
-      if (playerRight > platformLeft && playerLeft < platformRight && playerBottom > platformTop && playerTop < platformBottom) {
-        const prevPlayerBottom = playerPosition.y + PLAYER_SIZE;
-
-        if (prevPlayerBottom <= platformTop) { // Coming from above
-          newPos.y = platformTop - PLAYER_SIZE;
-          playerVelocity.current.y = 0;
-          isGrounded.current = true;
-        } else if (playerPosition.y >= platformBottom) { // Coming from below
-          newPos.y = platformBottom;
-          playerVelocity.current.y = 0;
-        } else if (playerRight > platformLeft && playerPosition.x < platformLeft) { // Coming from left
-           newPos.x = platformLeft - PLAYER_SIZE;
-           playerVelocity.current.x = 0;
-        } else if (playerLeft < platformRight && playerPosition.x > platformRight) { // Coming from right
-           newPos.x = platformRight;
-           playerVelocity.current.x = 0;
+        } else if (newVel.y < 0) { // Hitting from below
+          newPos.y = platform.position.y + platform.size.height;
+          newVel.y = 0;
         }
       }
     }
     
-    // Boundary checks
+    // 6. Final checks (boundaries, hazards, goal)
     if (newPos.x < 0) newPos.x = 0;
     if (newPos.x + PLAYER_SIZE > GAME_WIDTH) newPos.x = GAME_WIDTH - PLAYER_SIZE;
 
-    // Check for falling out of the world
     if (newPos.y > GAME_HEIGHT) {
       resetGame();
       return;
     }
 
-    // Goal detection
-    const dx = newPos.x + (PLAYER_SIZE / 2) - (level.goalPosition.x + 20);
-    const dy = newPos.y + (PLAYER_SIZE / 2) - (level.goalPosition.y + 20);
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    if (distance < (PLAYER_SIZE / 2 + 20)) {
-      setGameStatus('won');
+    if (level.hazards) {
+        for (const hazard of level.hazards) {
+            if (
+                newPos.x < hazard.position.x + hazard.size.width &&
+                newPos.x + PLAYER_SIZE > hazard.position.x &&
+                newPos.y < hazard.position.y + hazard.size.height &&
+                newPos.y + PLAYER_SIZE > hazard.position.y
+            ) {
+                resetGame();
+                return;
+            }
+        }
     }
 
+    const dx = newPos.x + (PLAYER_SIZE / 2) - (level.goalPosition.x + 20);
+    const dy = newPos.y + (PLAYER_SIZE / 2) - (level.goalPosition.y + 20);
+    if (Math.sqrt(dx * dx + dy * dy) < (PLAYER_SIZE / 2 + 20)) {
+      const finishedTime = performance.now() - startTimeRef.current;
+      setFinalTime(finishedTime);
+      setGameStatus('won');
+      onWin(finishedTime);
+    }
+
+    // 7. Update state for next frame
     setPlayerPosition(newPos);
-    playerRotation.current += playerVelocity.current.x * 2;
+    playerVelocity.current = newVel;
+    isGrounded.current = isNowGrounded;
+    platformPlayerIsOnRef.current = onPlatform;
+    playerRotation.current += newVel.x * 2;
+    
+    const newPlatformPositions: { [key: number]: Vector2D } = {};
+    currentPlatforms.forEach((p, index) => {
+        if (p.movement) {
+            newPlatformPositions[index] = p.position;
+        }
+    });
+    prevPlatformPositionsRef.current = newPlatformPositions;
+
     gameLoopRef.current = requestAnimationFrame(gameLoop);
-  }, [playerPosition, gameStatus, keyboardState, resetGame, level.platforms, level.goalPosition]);
+  }, [playerPosition, gameStatus, keyboardState, resetGame, level, onWin]);
 
   useEffect(() => {
     if (gameStatus === 'playing') {
@@ -130,6 +293,12 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onQuit }) => {
     };
   }, [gameStatus, gameLoop]);
 
+  useEffect(() => {
+    if (gameStatus === 'won') {
+      continueButtonRef.current?.focus();
+    }
+  }, [gameStatus]);
+
   return (
     <div className="flex flex-col items-center">
         <p className="text-gray-400 mb-4">Use as setas para mover e espaço para pular. Fase {level.id}: {level.name}</p>
@@ -138,27 +307,54 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onQuit }) => {
             style={{ width: GAME_WIDTH, height: GAME_HEIGHT }}
         >
             {gameStatus === 'won' && (
-            <div className="absolute inset-0 bg-black bg-opacity-70 flex flex-col items-center justify-center z-20">
-                <h2 className="text-6xl font-bold text-yellow-400 mb-8">Fase Concluída!</h2>
-                <button 
-                onClick={onWin}
-                className="px-8 py-4 bg-yellow-500 text-gray-900 font-bold text-xl rounded-lg shadow-lg hover:bg-yellow-400 transform hover:scale-105 transition-all duration-300"
+            <div className="absolute inset-0 bg-black bg-opacity-70 flex flex-col items-center justify-center z-30">
+                <h2 className="text-6xl font-bold text-yellow-400 mb-4">Fase Concluída!</h2>
+                <p className="text-3xl text-white mb-2">Seu tempo: {formatTime(finalTime)}</p>
+                {bestTime !== null && finalTime < bestTime && (
+                    <p className="text-3xl text-yellow-400 font-bold animate-pulse mb-4">Novo Recorde!</p>
+                )}
+                <p className="text-xl text-gray-400 mb-8">
+                    Melhor tempo: {bestTime ? formatTime(bestTime) : 'N/A'}
+                </p>
+                <button
+                    ref={continueButtonRef}
+                    onClick={onContinue}
+                    className="px-8 py-4 bg-yellow-500 text-gray-900 font-bold text-xl rounded-lg shadow-lg hover:bg-yellow-400 transform hover:scale-105 transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-yellow-300"
                 >
-                Continuar
+                    Continuar
                 </button>
             </div>
             )}
+            
+            <p className="absolute top-2 left-2 z-20 text-lg font-semibold text-white bg-black/30 px-2 rounded">
+                Tempo: {formatTime(elapsedTime)}
+            </p>
 
-            <button
-              onClick={onQuit}
-              className="absolute top-2 right-2 z-10 px-4 py-2 bg-red-600 text-white font-bold rounded-lg shadow-md hover:bg-red-500 transition-colors"
-              aria-label="Sair para o menu"
-            >
-              Sair
-            </button>
+            <div className="absolute top-2 right-2 z-20 flex items-center gap-2">
+                <button
+                    onClick={resetGame}
+                    className="px-4 py-2 bg-orange-600 text-white font-bold rounded-lg shadow-md hover:bg-orange-500 transition-colors"
+                    aria-label="Reiniciar o nível"
+                >
+                    Reiniciar
+                </button>
+                <button
+                    onClick={onQuit}
+                    className="px-4 py-2 bg-red-600 text-white font-bold rounded-lg shadow-md hover:bg-red-500 transition-colors"
+                    aria-label="Sair para o menu"
+                >
+                    Sair
+                </button>
+            </div>
 
-            {level.platforms.map((platform, index) => (
-            <Platform key={index} {...platform} />
+            {movingLiquidsRef.current.map((liquid, index) => (
+              <Liquid key={`liquid-${index}`} {...liquid} />
+            ))}
+            {movingPlatformsRef.current.map((platform, index) => (
+              <Platform key={`platform-${index}`} {...platform} />
+            ))}
+            {level.hazards?.map((hazard, index) => (
+              <Hazard key={`hazard-${index}`} {...hazard} />
             ))}
             <Goal position={level.goalPosition} />
             <Player position={playerPosition} rotation={playerRotation.current} />
