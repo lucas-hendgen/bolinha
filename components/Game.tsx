@@ -81,9 +81,8 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
       return;
     }
     
-    setElapsedTime(performance.now() - startTimeRef.current);
-
-    const time = performance.now();
+    const elapsedMs = performance.now() - startTimeRef.current;
+    setElapsedTime(elapsedMs);
 
     // 1. Update moving platforms and liquids
     const currentPlatforms = level.platforms.map(p => {
@@ -91,7 +90,7 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
         const newPlatform = { ...p, position: { ...p.position } };
         const totalDistance = p.movement.range[1] - p.movement.range[0];
         const cycleDuration = (totalDistance / p.movement.speed) * 2;
-        const phase = (time / 1000) % cycleDuration;
+        const phase = (elapsedMs / 1000) % cycleDuration;
         
         let positionOffset;
         if (phase <= cycleDuration / 2) {
@@ -116,13 +115,12 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
         const newLiquid = { ...l, position: { ...l.position } };
         const totalDistance = l.movement.range[1] - l.movement.range[0];
         const cycleDuration = (totalDistance / l.movement.speed) * 2;
-        const phase = (time / 1000) % cycleDuration;
+        const phase = (elapsedMs / 1000) % cycleDuration;
         
         let positionOffset;
         if (phase <= cycleDuration / 2) {
           positionOffset = phase * l.movement.speed;
         } else {
-          // FIX: Corrected a typo using 'p' instead of 'l' for liquid movement calculation.
           positionOffset = (cycleDuration - phase) * l.movement.speed;
         }
 
@@ -141,7 +139,24 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
     let newPos = { ...playerPosition };
     let newVel = { ...playerVelocity.current };
     let isNowGrounded = false;
-    let onPlatform: PlatformType | null = null;
+    
+    // If player was on a moving platform, move them with it first.
+    if (platformPlayerIsOnRef.current?.movement) {
+        const platformThePlayerIsOn = platformPlayerIsOnRef.current;
+        const originalPlatformIndex = level.platforms.findIndex(p => p === platformThePlayerIsOn);
+        
+        if (originalPlatformIndex !== -1) {
+            const prevPlatformPos = prevPlatformPositionsRef.current[originalPlatformIndex];
+            const currentPlatform = movingPlatformsRef.current[originalPlatformIndex];
+            
+            if (prevPlatformPos && currentPlatform) {
+                const dx = currentPlatform.position.x - prevPlatformPos.x;
+                const dy = currentPlatform.position.y - prevPlatformPos.y;
+                newPos.x += dx;
+                newPos.y += dy;
+            }
+        }
+    }
     
     // 3. Check for water physics
     let inWater = false;
@@ -172,10 +187,9 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
       newVel.x *= currentFriction;
     }
 
-    // Use grounded state from *previous* frame for jump check
     if (Space && isGrounded.current) {
       newVel.y = currentJumpForce;
-      isGrounded.current = false; // Prevent multi-jumps
+      isGrounded.current = false;
       platformPlayerIsOnRef.current = null;
     }
 
@@ -202,6 +216,7 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
 
     // Y-axis
     newPos.y += newVel.y;
+    let platformLandedOn: PlatformType | null = null;
     for (const platform of currentPlatforms) {
       if (
         newPos.x + PLAYER_SIZE > platform.position.x &&
@@ -210,19 +225,14 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
         newPos.y < platform.position.y + platform.size.height
       ) {
         // Landing on a platform
-        if (newVel.y > 0 && playerPosition.y + PLAYER_SIZE <= platform.position.y + 1) {
+        if (newVel.y >= 0 && playerPosition.y + PLAYER_SIZE <= platform.position.y + 1.5) {
           newPos.y = platform.position.y - PLAYER_SIZE;
           newVel.y = 0;
           isNowGrounded = true;
 
-          const originalPlatformIndex = currentPlatforms.indexOf(platform);
-          onPlatform = level.platforms[originalPlatformIndex];
-
-          // Carry player with the platform horizontally
-          const prevPlatformPos = prevPlatformPositionsRef.current[originalPlatformIndex];
-          if (prevPlatformPos) {
-              const dx = platform.position.x - prevPlatformPos.x;
-              newPos.x += dx;
+          const originalPlatformIndex = movingPlatformsRef.current.indexOf(platform);
+          if (originalPlatformIndex !== -1) {
+            platformLandedOn = level.platforms[originalPlatformIndex];
           }
 
         } else if (newVel.y < 0) { // Hitting from below
@@ -268,7 +278,13 @@ export const Game: React.FC<GameProps> = ({ level, onWin, onContinue, onQuit, be
     setPlayerPosition(newPos);
     playerVelocity.current = newVel;
     isGrounded.current = isNowGrounded;
-    platformPlayerIsOnRef.current = onPlatform;
+    
+    if (isNowGrounded) {
+        platformPlayerIsOnRef.current = platformLandedOn;
+    } else {
+        platformPlayerIsOnRef.current = null;
+    }
+    
     playerRotation.current += newVel.x * 2;
     
     const newPlatformPositions: { [key: number]: Vector2D } = {};
